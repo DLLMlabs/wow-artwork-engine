@@ -205,19 +205,33 @@ usable card usable.
     upscaled 4× by Topaz before download (billboards need it at street scale). Best-effort:
     a failed upscale delivers the un-upscaled clip rather than losing the paid generation.
     `FAL_UPSCALE=0` turns it back off for fast/cheap visual iteration.
-11. **Letterbox extraction: geometry + proof, never-stretch** *(2026-08-14, rounds 2+4)*.
+11. **Letterbox extraction: geometry + measured edges, never-pad, never-stretch**
+    *(2026-08-14 rounds 2+4; 2026-10-21 Jeff: "letterboxed or with an L shape black box")*.
     Seedance can't output the extreme 3.6:1, so it letterboxes the art in a taller canvas.
-    The bars' position is computed from GEOMETRY (design aspect vs raw canvas) — never
-    cropdetect, which couldn't tell padding from the artwork's own painted black frame and
-    ate the frame on the cheetah render. The crop happens only after PROOF that the
-    stripped regions measure near-black; otherwise nothing is cropped. Content that still
-    mismatches is **never stretched** — delivered undistorted (padded) with a loud flag.
+    Three steps, each the next one's safety net (`bars.js`):
+    1. **Geometry** — the bars' position is computed from the design aspect vs the raw
+       canvas — never cropdetect alone, which couldn't tell padding from the artwork's own
+       painted black frame and ate the frame on the cheetah render. The crop happens only
+       after PROOF that the stripped regions measure near-black.
+    2. **Measured residue** — Seedance drifts (a slow zoom or pan), so step 1 could leave a
+       sliver of padding on one or two edges (the L shape), or fail its proof and ship the
+       whole padded canvas (the letterbox). The clip's real content box is now measured
+       over its full length and every edge that is proven flat black (mean luma ≤ 28, no
+       pixel above 80) is removed. A framed design (option 1) keeps its uniform painted
+       border — only the excess over it is stripped; a borderless design keeps no black
+       edge at all.
+    3. **Fit** — content is never stretched and never padded: if the aspect still mismatches
+       the spec it is center-cropped to fill edge to edge, with a loud flag on the card.
+    Finally the **delivered file itself is audited**: any proven-black edge left on it raises
+    a red "BLACK BARS remain — do not send" flag on the row.
 12. **QA.** Saturation-drift measurement (warning only — Seedance colors can drain), and
     **frame-order fidelity** *(2026-08-15)*: SSIM of the clip's first and last frames vs
     the approved still, logged on every render — a card flag fires whenever the END
     resembles the still more than the start ("the model animated toward the input"), so
     the first-frame-vs-last-frame question is answered with data, not eyeballing.
-13. **Conform.** Exact-fit scale to delivery spec — spectacular 3840×1062; EON at
+13. **Conform.** Exact-fit scale to delivery spec — spectacular **1692×468** *(Jeff's
+    2026-10-21 email: "final renders should be: Spectaculars - 1692w x 468h"; was 4K-class
+    3840×1062, identical aspect)*; EON at
     **Jeff's panel-native sizes** *(2026-08-21 email: spine 64×384, face 256×384,
     3-pillar master 960×384)*. **Nothing is composited onto the video** — the file
     ships exactly as the model made it. EON masters are still sliced into per-panel
@@ -294,9 +308,9 @@ living environment, letterbox-margin dead space, anti-drift. It swaps in:
 | 6 | Colors never wash out / drift grey | Constancy clause + post-hoc saturation QA warning |
 | 7 | Any characters welcome — creatures, people, living objects; no text/logos/watermarks | Still prompt creative-freedom clause; nudity guardrail before every spend |
 | 8 | Fresh subjects + environments every batch | Prompt seed now salts with the batch id — no weekly repetition |
-| 9 | Failures are visible, never masked, never stretched | Black padding extracted (cropdetect); true aspect mismatch → padded + flagged, no distortion |
+| 9 | Failures are visible, never masked, never stretched, **never padded** | Geometry + measured edge strip (`bars.js`); a true aspect mismatch → center-cropped to fill + flagged; the delivered file is audited for leftover black edges |
 | 11 | The motion has a story — beginning, journey, payoff — with zero timestamps | One untimed story sentence naming the design's own cast |
-| 10 | Delivery: exact pixels (spectacular 3840×1062; EON one master 960×384 — spine 64 + face 256 per pillar, per Jeff 2026-08-21) | Conform exact-fit; EON ships the single wrapped master and skips Topaz |
+| 10 | Delivery: exact pixels (spectacular 1692×468 per Jeff 2026-10-21; EON one master 960×384 — spine 64 + face 256 per pillar, per Jeff 2026-08-21) | Conform exact-fit; EON ships the single wrapped master and skips Topaz |
 
 ## The painter: GPT Image 2.5 (Shawn, 2026-09-15)
 
@@ -349,6 +363,14 @@ Same interface: the output URL is the first frame Seedance animates.
   → option 1 stays the framed mastery track; options 2 & 3 go borderless full-bleed,
   tuned for maximum intensity and story, ready to ship while the border keeps being
   mastered on option 1.
+- **10-21 (Jeff: "letterboxed or with an L shape black box"):** the week-of-10-19 files
+  reached Jeff with padding on them. Root cause: the post-render bar strip trusted
+  geometry alone — when Seedance drifted the art a few percent, the strip left a sliver
+  (the L shape), and when the drift failed the proof step the fallback delivered the whole
+  padded canvas (the letterbox). Now the real edges are measured over the whole clip and
+  stripped after proof, the final fit never pads (center-crop instead), and the delivered
+  file is audited for leftover black. Same email: spectacular delivery size is now his
+  native **1692×468** (was 4K-class 3840×1062, same aspect).
 - **08-18 (production mode):** iteration mode over — spectaculars back to the full 30s
   piece and Topaz 4K upscale re-enabled for real deliveries (~$16.20/render).
   `GEN_SPECTACULAR_DURATION_S=10` + `FAL_UPSCALE=0` bring back cheap iteration rounds.
