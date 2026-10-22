@@ -50,8 +50,12 @@ function estimateMotionUsd(a) {
   const tier = falPricing.seedanceTier(a.model);
   const render = falPricing.renderDimsForTier(aspect, tier);
   const seedance = falPricing.seedanceCostUsd({ ...render, durationS: seconds, tier });
+  // Topaz bills its OUTPUT — the upscaled render canvas, not the delivery
+  // spec (the spectacular ships at 1692x468 since 2026-10-21, far below the
+  // 4x pass's actual output), so price render × factor.
+  const upFactor = config.fal.upscale.factor || 1;
   const topaz = falPricing.usedTopaz(a.model)
-    ? falPricing.topazCostUsd({ width: a.width, height: a.height, durationS: seconds })
+    ? falPricing.topazCostUsd({ width: render.width * upFactor, height: render.height * upFactor, durationS: seconds })
     : 0;
   return { seedance, topaz };
 }

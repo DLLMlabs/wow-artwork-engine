@@ -22,7 +22,7 @@ then expensive **4K videos** only on the designs Scott approves.
 
 | Sign | Final output | Look |
 |---|---|---|
-| **Spectacular** (street billboard) | 4K 3840×1062 | 3D "pop-out" — subject bursts out of a black frame painted into the art |
+| **Spectacular** (street billboard) | 1692×468 (panel-native per Jeff, 2026-10-21) | 3D "pop-out" — subject bursts out of a black frame painted into the art |
 | **EON — 3-pillar set** | ONE master strip **960×384** (per pillar: spine 64×384 + face 256×384 — Jeff's panel-native, 2026-08-21) | the artwork travels pillar-to-pillar and wraps around each corner |
 | **EON — single pillar** | ONE master strip **320×384** (spine 64×384 + face 256×384) | standalone vertical piece, wrapping its own corner |
 

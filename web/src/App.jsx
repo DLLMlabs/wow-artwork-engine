@@ -691,7 +691,7 @@ function SkeletonPage() {
       <section>
         <SkeletonHeading />
         <div className="space-y-4">
-          {[0, 1, 2].map((i) => <SkeletonCard key={i} aspect="3840 / 1062" />)}
+          {[0, 1, 2].map((i) => <SkeletonCard key={i} aspect="1692 / 468" />)}
         </div>
       </section>
       <section>

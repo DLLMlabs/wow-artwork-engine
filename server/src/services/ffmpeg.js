@@ -303,6 +303,76 @@ export async function detectContentCrop(input, { seconds = 2, limit = 24 } = {})
   return { width: w, height: h, x, y };
 }
 
+/** Sampling rate that yields at least ~8 frames from a clip of `durationS`. Pure. */
+export function sampleFrameRate(durationS, sampleFps = 2, minFrames = 8) {
+  if (!durationS || durationS <= 0) return sampleFps;
+  return Math.max(sampleFps, Math.ceil(minFrames / durationS));
+}
+
+/**
+ * Content bounding box over the WHOLE clip (sampled at `sampleFps`): the
+ * largest non-black area cropdetect sees anywhere in the clip (reset=0 never
+ * resets, so the box is the union across frames — a character that ever
+ * reaches an edge keeps that edge). Returns { width, height, box } where box
+ * is { width, height, x, y } or null when the full frame is content. Used by
+ * bars.js to find padding the model left around the art after the geometric
+ * strip (Jeff, 2026-10-21: letterboxed / L-shaped deliveries).
+ */
+export async function detectContentBox(input, { limit = 40, sampleFps = 2 } = {}) {
+  const probed = await probe(input);
+  // skip=0: cropdetect ignores its first two frames by default, which on a
+  // short sampled clip is every frame. Short clips also sample faster so the
+  // box is built from at least ~8 frames.
+  const fps = sampleFrameRate(probed.duration, sampleFps);
+  const args = [
+    '-i', input,
+    '-vf', `fps=${fps},cropdetect=limit=${limit}:round=2:reset=0:skip=0`,
+    '-f', 'null', '-',
+  ];
+  let stderr = '';
+  try {
+    ({ stderr } = await execFileP(FFMPEG(), args, { maxBuffer: 1024 * 1024 * 32 }));
+  } catch (err) {
+    stderr = String(err.stderr || '');
+    if (!stderr.includes('crop=')) throw err;
+  }
+  const matches = [...String(stderr).matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
+  if (!matches.length || !probed.width) return { width: probed.width, height: probed.height, box: null };
+  const [, w, h, x, y] = matches[matches.length - 1].map(Number);
+  if (w < 16 || h < 16) return { width: probed.width, height: probed.height, box: null }; // all-dark scene
+  if (w >= probed.width && h >= probed.height) return { width: probed.width, height: probed.height, box: null };
+  return { width: probed.width, height: probed.height, box: { width: w, height: h, x, y } };
+}
+
+/**
+ * Luma statistics of a region over the clip (sampled): { yavg, ymax } on the
+ * 0-255 scale — mean across frames and the single brightest pixel seen. The
+ * proof that a band is flat padding (pure black pads at yavg ≈ 16, ymax ≈ 17)
+ * rather than dark art. Returns null when unmeasurable.
+ */
+export async function regionStats(input, { width, height, x, y, sampleFps = 2 } = {}) {
+  let fps = sampleFps;
+  try { fps = sampleFrameRate((await probe(input)).duration, sampleFps); } catch { /* keep the default */ }
+  const args = [
+    '-i', input,
+    '-vf', `fps=${fps},crop=${width}:${height}:${x}:${y},signalstats,` +
+      'metadata=print:key=lavfi.signalstats.YAVG:file=-,metadata=print:key=lavfi.signalstats.YMAX:file=-',
+    '-f', 'null', '-',
+  ];
+  try {
+    const { stdout } = await execFileP(FFMPEG(), args, { maxBuffer: 1024 * 1024 * 32 });
+    const avgs = [...String(stdout).matchAll(/YAVG=([\d.]+)/g)].map((m) => Number(m[1]));
+    const maxs = [...String(stdout).matchAll(/YMAX=([\d.]+)/g)].map((m) => Number(m[1]));
+    if (!avgs.length) return null;
+    return {
+      yavg: avgs.reduce((a, b) => a + b, 0) / avgs.length,
+      ymax: maxs.length ? Math.max(...maxs) : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * GEOMETRIC bar crop — where letterbox/pillarbox bars MUST be if the model
  * padded `wantAspect` content into a raw canvas, computed from shape alone.
@@ -481,6 +551,9 @@ export default {
   pingpong,
   probe,
   detectContentCrop,
+  detectContentBox,
+  regionStats,
+  sampleFrameRate,
   computeBarCrop,
   regionMeanLuma,
   extractFrameAt,
