@@ -11,8 +11,10 @@
 import config from '../../config/index.js';
 
 // key → exact output pixels.
-// SPECTACULAR stays 4K-class per Shawn (2026-07-14): "output needs to be 4K
-// … keep the same aspect ratios".
+// SPECTACULAR is PANEL-NATIVE per Jeff (2026-10-21 email: "final renders
+// should be: Spectaculars - 1692w x 468h"). It was 4K-class 3840×1062 (Shawn,
+// 2026-07-14) — same 3.615:1 aspect, so compositions are untouched; the sign
+// now gets exactly its own pixels instead of downscaling a 4K file.
 // EON is PANEL-NATIVE per Jeff (2026-08-21 email): "Spines: 64w x 384h each ·
 // Faces: 256w x 384h each · Total master size: 960w x 384". The old 5x
 // oversize made his players downscale every panel; delivering his exact LED
@@ -20,7 +22,7 @@ import config from '../../config/index.js';
 // turnaround. Aspects are identical (spine 1:6, face 2:3, pod split 20/80),
 // so compositions are untouched — only pixels change.
 export const SPECS = {
-  spectacular_wow1_8: { surface: 'spectacular', width: 3840, height: 1062 },
+  spectacular_wow1_8: { surface: 'spectacular', width: 1692, height: 468 },
   eon_face: { surface: 'eon', width: 256, height: 384 },
   eon_spine: { surface: 'eon', width: 64, height: 384 },
   // Wrapped masters — see EON_POD below. 3 pods = 960 wide, 1 pod = 320.

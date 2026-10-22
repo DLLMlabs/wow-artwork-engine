@@ -109,10 +109,11 @@ const config = {
     upscale: {
       enabled: process.env.FAL_UPSCALE === undefined ? true : ['1', 'true', 'yes', 'on'].includes(String(process.env.FAL_UPSCALE).toLowerCase()),
       model: process.env.FAL_UPSCALE_MODEL || 'fal-ai/topaz/upscale/video',
-      // 4x pairs with the 720p Seedance tier: 1680x720 → 6720x2880, conformed
-      // DOWN to the 3840-wide spec (2x left conform upscaling 1.14x in plain
-      // ffmpeg — soft). Topaz bills per output second tiered by resolution, so
-      // 4x costs the same as 2x at >1080p output.
+      // 4x pairs with the 720p Seedance tier: 1280x720 → 5120x2880, conformed
+      // DOWN to the spec (1692-wide since Jeff's 2026-10-21 email; the art band
+      // of a raw 720p render is only ~1280 wide, so the pass still adds real
+      // detail). Topaz bills per output second tiered by resolution, so 4x
+      // costs the same as 2x at >1080p output.
       factor: num(process.env.FAL_UPSCALE_FACTOR, 4),
     },
   },
