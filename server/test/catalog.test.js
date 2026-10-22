@@ -3,8 +3,8 @@ import assert from 'node:assert/strict';
 
 import { SPECS, SURFACES, POST, EON_POD, POD_WIDTH, planJobs } from '../src/services/generation/catalog.js';
 
-test('SPECS: spectacular stays 4K-class; EON is Jeff\'s panel-native (2026-08-21 email)', () => {
-  assert.deepEqual(SPECS.spectacular_wow1_8, { surface: 'spectacular', width: 3840, height: 1062 });
+test('SPECS: spectacular (2026-10-21) and EON (2026-08-21) are Jeff\'s panel-native sizes', () => {
+  assert.deepEqual(SPECS.spectacular_wow1_8, { surface: 'spectacular', width: 1692, height: 468 });
   // Jeff, verbatim: "Spines: 64w x 384h each · Faces: 256w x 384h each ·
   // Total master size: 960w x 384".
   assert.deepEqual(SPECS.eon_face, { surface: 'eon', width: 256, height: 384 });

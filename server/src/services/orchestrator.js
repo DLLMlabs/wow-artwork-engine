@@ -22,6 +22,7 @@ import config from '../config/index.js';
 import logger from '../config/logger.js';
 import ffmpeg from './ffmpeg.js';
 import { sliceMaster } from './eonSlicer.js';
+import { isFramedPrompt, stripResidualBars, proveResidualBars, fitForAspect, describeEdges } from './bars.js';
 import * as guardrailsModule from './guardrails.js';
 import * as qaModule from './qa.js';
 import { planJobs, POST, SURFACES, SPECS } from './generation/catalog.js';
@@ -803,26 +804,37 @@ async function animateStill(still, ctx) {
   const ref = path.join(dir, 'ref.png');
   await writeFile(ref, await store.getBuffer(still.s3_key_final));
 
-  // ASPECT HANDLING (Shawn, 2026-08-14, rounds 2+4). Seedance cannot output
-  // the spectacular's extreme 3.6:1: it returns a taller canvas with the art
-  // LETTERBOXED inside black bars. Rules:
-  //   1. The bars' position is computed from GEOMETRY alone (the design's
-  //      aspect vs the raw canvas) — never from cropdetect, which cannot
-  //      tell padding from the artwork's own painted black frame and ate the
-  //      frame on the first live cheetah render (round 4).
-  //   2. The crop only happens after PROOF: the stripped regions must
-  //      measure near-black. If they don't, nothing is cropped — the render
-  //      is delivered undistorted (padded) and flagged.
-  //   3. If content still doesn't match the design's aspect, it is NEVER
-  //      stretched (fit 'contain' pads) and the row is flagged loudly.
+  // ASPECT HANDLING (Shawn, 2026-08-14, rounds 2+4 · Jeff, 2026-10-21).
+  // Seedance cannot output the spectacular's extreme 3.6:1 (or the EON
+  // master's 2.5:1): the reference goes in pre-letterboxed to 16:9 (below)
+  // and the render comes back with that padding, which must come OFF before
+  // the file reaches the sign. Three steps, each the next one's safety net:
+  //   1. GEOMETRY — the bars' position is computed from shape alone (the
+  //      design's aspect vs the raw canvas), never from cropdetect, which
+  //      cannot tell padding from the artwork's own painted black frame and
+  //      ate the frame on the first live cheetah render (round 4). The crop
+  //      happens only after PROOF that both bands measure near-black.
+  //   2. MEASURED residue (bars.js) — Seedance drifts: a slow zoom or pan
+  //      moves the art a few percent, so step 1 leaves a sliver on one or
+  //      two edges (Jeff's "L shape black box"); or the drift fails step 1's
+  //      proof and — until 2026-10-21 — the whole padded canvas went out
+  //      ("letterboxed"). The clip's real content box is measured over its
+  //      whole length and every proven-black edge is removed: a framed
+  //      design keeps its uniform painted border, a borderless one keeps no
+  //      black edge at all.
+  //   3. FIT — content is NEVER stretched and, since 2026-10-21, NEVER padded
+  //      either: an aspect that still mismatches is center-cropped to fill
+  //      the spec edge to edge, and the row is flagged for the reviewer.
+  const framed = surface.post === POST.FRAME_BREAK && isFramedPrompt(still.prompt);
   const extractContent = async (input, model) => {
     if (String(model || '').startsWith('fixture') || !still.width || !still.height) {
-      return { path: input, warn: null };
+      return { path: input, warn: null, fit: 'exact' };
     }
     let contentPath = input;
+    const want = still.width / still.height;
+    // Step 1 — geometry + proof.
     try {
       const rawDims = await ffmpeg.probe(input);
-      const want = still.width / still.height;
       const bars = ffmpeg.computeBarCrop({ rawWidth: rawDims.width, rawHeight: rawDims.height, wantAspect: want });
       if (bars) {
         // Proof step: both stripped regions must be near-black padding.
@@ -846,24 +858,41 @@ async function animateStill(still, ctx) {
           logger.info({ stillId: still.id, bars, lumas }, 'Model letterboxed the render — stripped the proven-black padding');
           contentPath = out;
         } else {
-          logger.warn({ stillId: still.id, bars, lumas }, 'Aspect excess is NOT black padding — leaving the render uncropped');
+          logger.warn({ stillId: still.id, bars, lumas }, 'Aspect excess is NOT proven-black padding — geometry left alone; measuring the real edges next');
         }
       }
     } catch (err) {
       logger.warn({ stillId: still.id, err: err.message }, 'Letterbox extraction failed; using raw output');
     }
+    // Step 2 — measured residue, proven flat-black edge by edge.
+    try {
+      const out = path.join(dir, 'content_edges.mp4');
+      const r = await stripResidualBars({ input: contentPath, output: out, framed });
+      if (r.path !== contentPath) {
+        logger.info({ stillId: still.id, framed, stripped: describeEdges(r.strip), rejected: r.rejected }, 'Stripped residual black edges the model left around the art');
+        contentPath = r.path;
+      } else if (r.rejected.length) {
+        logger.info({ stillId: still.id, rejected: r.rejected, thickness: r.thickness }, 'Dark edges are art, not padding — left in place');
+      }
+    } catch (err) {
+      logger.warn({ stillId: still.id, err: err.message }, 'Residual edge measurement failed; keeping the geometric result');
+    }
+    // Step 3 — fit: exact when the aspect matches, center-crop otherwise.
     try {
       const dims = await ffmpeg.probe(contentPath);
-      const want = still.width / still.height;
-      const got = dims.width / dims.height;
-      if (dims.width && Math.abs(got - want) / want > 0.03) {
-        logger.warn({ stillId: still.id, content: `${dims.width}x${dims.height}`, want: want.toFixed(3) }, 'Content aspect mismatch after bar extraction — will pad, never stretch');
-        return { path: contentPath, warn: `qa: model content is ${dims.width}x${dims.height} (aspect ${got.toFixed(2)}) vs the design's ${want.toFixed(2)} — delivered undistorted (padded, not stretched)` };
+      const fit = fitForAspect({ width: dims.width, height: dims.height, wantAspect: want });
+      if (fit === 'cover') {
+        const got = dims.width / dims.height;
+        logger.warn({ stillId: still.id, content: `${dims.width}x${dims.height}`, want: want.toFixed(3) }, 'Content aspect mismatch after bar extraction — will center-crop to fill, never pad or stretch');
+        return {
+          path: contentPath, fit,
+          warn: `qa: model content is ${dims.width}x${dims.height} (aspect ${got.toFixed(2)}) vs the design's ${want.toFixed(2)} — delivered edge-to-edge by center-cropping the excess (never padded, never stretched); check the edges`,
+        };
       }
     } catch (err) {
       logger.warn({ stillId: still.id, err: err.message }, 'Aspect check failed');
     }
-    return { path: contentPath, warn: null };
+    return { path: contentPath, warn: null, fit: 'exact' };
   };
 
   // The whole piece — every act — in ONE Seedance call. The chain-era
@@ -913,6 +942,7 @@ async function animateStill(still, ctx) {
   const extracted = await extractContent(raw, gen.model);
   const content = extracted.path;
   const aspectWarn = extracted.warn;
+  const contentFit = extracted.fit ?? 'exact';
 
   // QA: measure saturation drift on the model's raw output (Seedance colors
   // drain over a clip). Warning only — stored on the motion rows.
@@ -974,8 +1004,12 @@ async function animateStill(still, ctx) {
   // 1080p (live validation 2026-08-05: ledger said $22.84 for a ~$12 run).
   const render = falPricing.renderDimsForResolution(aspect, config.fal.resolution);
   const seedanceUsd = live ? falPricing.seedanceCostUsd({ ...render, durationS: totalS, tier }) : 0;
+  // Topaz bills its OUTPUT pixels — the upscaled Seedance canvas (render ×
+  // factor), not the delivery spec: the spectacular ships at Jeff's native
+  // 1692×468 (2026-10-21), far below what the 4x pass actually produced.
+  const upFactor = config.fal.upscale.factor || 1;
   const topazUsd = live && falPricing.usedTopaz(gen.model)
-    ? falPricing.topazCostUsd({ width: finalSpec.width, height: finalSpec.height, durationS: totalS, fps })
+    ? falPricing.topazCostUsd({ width: render.width * upFactor, height: render.height * upFactor, durationS: totalS, fps })
     : 0;
   const callCostUsd = Math.round((seedanceUsd + topazUsd) * 1e4) / 1e4;
   // One fal call = one bill. EON_SLICE stores a row per panel cut from that
@@ -995,6 +1029,25 @@ async function animateStill(still, ctx) {
     themeLabel: still.theme_label ?? null,
     s3KeyRaw: rawPut.key, error: qaWarn, ...extra,
   });
+  const rowError = (extra) => [qaWarn, extra].filter(Boolean).join(' | ') || null;
+
+  // LAST LINE OF DEFENCE (Jeff, 2026-10-21): measure the file that will
+  // actually ship. Any proven-black edge still present — beyond a framed
+  // design's uniform painted border — is flagged in red on the card so it
+  // never goes out unnoticed. Fixtures are skipped (synthetic art, synthetic
+  // edges).
+  const auditDelivered = async (file) => {
+    if (String(gen.model || '').startsWith('fixture')) return null;
+    try {
+      const p = await proveResidualBars(file, { framed });
+      if (!p.plan) return null;
+      logger.error({ stillId: still.id, thickness: p.thickness, strip: p.plan.strip }, 'BLACK BARS remain on the delivered file');
+      return `qa: BLACK BARS remain on the delivered file (${describeEdges(p.plan.strip)}) — do not send; re-animate`;
+    } catch (err) {
+      logger.warn({ stillId: still.id, err: err.message }, 'Delivered-file bar audit failed');
+      return null;
+    }
+  };
 
   if (surface.post === POST.EON_SLICE) {
     // The wrapped master covers every pod slab side by side (spine + face per
@@ -1002,9 +1055,12 @@ async function animateStill(still, ctx) {
     // corner onto the spine instead of the spine being a separate afterthought.
     const pods = surface.pods ?? 3;
     const master = path.join(dir, 'master.mp4');
-    // fit 'exact': the master's edges ARE content (fold alignment for the
-    // panel cuts), so aspect error must cost a hair of squash, never a crop.
-    await ffmpeg.conform({ input: srcVideo, output: master, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: 'exact' });
+    // fit 'exact' when the aspect matches (a pure scale — the master's edges
+    // ARE content, the fold alignment for the panel cuts); on a flagged
+    // mismatch 'cover' center-crops the excess. Never 'contain': padding is
+    // the letterbox Jeff saw (2026-10-21).
+    await ffmpeg.conform({ input: srcVideo, output: master, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: contentFit });
+    const barsWarn = await auditDelivered(master);
     const masterPut = await store.put({ key: key('master.mp4'), sourcePath: master });
     const panels = await sliceMaster({ masterPath: master, outDir: dir, pods, duration: effDuration });
 
@@ -1026,6 +1082,7 @@ async function animateStill(still, ctx) {
         width: panel.width, height: panel.height,
         durationS: Math.round(probed.duration ?? effDuration),
         s3KeyFinal: panelPut.key, thumbnailKey: thumbPut.key, status: 'ready',
+        error: rowError(barsWarn),
         ...ledger(shares[i]),
       });
       ids[panel.label] = a.id;
@@ -1052,9 +1109,11 @@ async function animateStill(still, ctx) {
   // fit 'exact': the spectacular's painted frame lives in the outermost
   // pixels — cover's center-crop paid for any aspect error with exactly those
   // pixels, visibly thinning the frame even with a locked camera.
-  // 'exact' is a pure scale when the aspect matched (guaranteed above); on a
-  // flagged mismatch 'contain' pads instead — the art is never distorted.
-  await ffmpeg.conform({ input: srcVideo, output: final, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: aspectWarn ? 'contain' : 'exact' });
+  // 'exact' is a pure scale when the aspect matched; on a flagged mismatch
+  // 'cover' center-crops the excess — never 'contain' (padding IS the
+  // letterbox Jeff saw, 2026-10-21) and never a stretch.
+  await ffmpeg.conform({ input: srcVideo, output: final, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: contentFit });
+  const barsWarn = await auditDelivered(final);
   // FRAME PLATE on the delivered video: OFF by default (Shawn, 2026-08-11).
   // The stamp was burying characters that Seedance correctly rendered IN FRONT
   // of its painted frame — the post-composited-letterbox failure of 2026-07-21
@@ -1072,6 +1131,7 @@ async function animateStill(still, ctx) {
     specKey: surface.specKey, width: finalSpec.width, height: finalSpec.height,
     durationS: Math.round(probed.duration ?? effDuration),
     s3KeyFinal: finalPut.key, thumbnailKey: thumbPut.key, status: 'ready',
+    error: rowError(barsWarn),
     ...ledger(),
   });
   return 1;

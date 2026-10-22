@@ -14,6 +14,8 @@ import { SURFACES } from '../src/services/generation/catalog.js';
 import { motionProvider, stillProvider } from '../src/services/generation/fixture.js';
 import { wildThemeFor } from '../src/services/generation/prompts.js';
 import ffmpeg from '../src/services/ffmpeg.js';
+import { proveResidualBars, isFramedPrompt } from '../src/services/bars.js';
+import { rename } from 'node:fs/promises';
 
 const execFileP = promisify(execFile);
 async function hasFfmpeg() {
@@ -112,7 +114,7 @@ test('Phase 2: animateRun animates ONLY approved stills, conformed to spec, link
     // Motions are conformed to the exact sign specs.
     const spec = motions.find((m) => m.style === 'frame_break');
     let p = await ffmpeg.probe(store.localPath(spec.s3_key_final));
-    assert.equal(p.width, 3840); assert.equal(p.height, 1062);
+    assert.equal(p.width, 1692); assert.equal(p.height, 468); // Jeff, 2026-10-21
     // The spectacular renders its configured TOTAL length in one call
     // (production: config.spectacularDurationS; the test script pins
     // GEN_SPECTACULAR_DURATION_S=2 so fixtures stay fast). EON clips use the
@@ -735,6 +737,100 @@ test('story director: falls back to the template chase story without a director/
     const { runId } = await runWeek({ weekOf: '2026-08-17', triggeredBy: 'test', deps: { repo, store, providers, surfaces: spectacularOnly, optionsPerSurface: 1, duration: 1 } });
     const [still] = await repo.listArtworks(runId);
     assert.match(still.motion_prompt, /A chase with real stakes/, 'template story stands when no director can run');
+  } finally {
+    await rm(base, { recursive: true, force: true });
+  }
+});
+
+// Jeff (2026-10-21): "these final renders … are exporting out either
+// letterboxed or with an L shape black box." Simulate what Seedance really
+// returns — the art letterboxed inside a 16:9 canvas AND drifted off-centre so
+// the bars are uneven — and prove every delivered file is edge-to-edge art
+// at the exact spec: no letterbox, no L, no padding, and no stretch.
+test('letterboxed + drifted model output ships edge-to-edge at spec (no bars, no L shape)', async (t) => {
+  if (!(await hasFfmpeg())) return t.skip('ffmpeg not installed');
+  const { base, repo, store } = await harness();
+  const seedanceLike = {
+    mode: 'fixture',
+    still: stillProvider,
+    motion: {
+      ...motionProvider,
+      async generate(args) {
+        const res = await motionProvider.generate(args);
+        // Re-stage the clip the way a drifting Seedance does: the art shrunk
+        // into a 1280x720 canvas and pushed down + right, so the padding is
+        // uneven — left 60, top 180, right 20, bottom whatever is left.
+        const artH = Math.round(1200 / (args.width / args.height) / 2) * 2;
+        const staged = `${args.output}.staged.mp4`;
+        await execFileP('ffmpeg', [
+          '-y', '-i', args.output,
+          '-vf', `scale=1200:${artH},pad=1280:720:60:180:black,format=yuv420p`,
+          '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-an', staged,
+        ]);
+        await rename(staged, args.output);
+        return { ...res, model: 'seedance-sim@test', width: 1280, height: 720 };
+      },
+    },
+  };
+  const surfaces = SURFACES.filter((s) => s.key === 'spectacular' || s.key === 'eon_connected');
+  try {
+    // Two spectacular options: option 1 carries the painted frame, option 2 is
+    // borderless — both must come out clean.
+    const { runId } = await runWeek({ weekOf: '2026-10-19', triggeredBy: 'test', deps: { repo, store, providers: seedanceLike, surfaces, optionsPerSurface: 2, duration: 1 } });
+    const stills = await repo.listArtworks(runId);
+    for (const st of stills) await repo.updateArtwork(st.id, { status: 'approved' });
+    const summary = await animateRun({ runId, deps: { repo, store, providers: seedanceLike, duration: 1 } });
+    assert.equal(summary.counts.failed ?? 0, 0);
+
+    const all = await repo.listArtworks(runId);
+    const motions = all.filter((a) => a.stage === 'motion');
+    assert.ok(motions.length >= 2 + 12, `expected spectaculars + 2x6 EON panels, got ${motions.length}`);
+    for (const m of motions) {
+      assert.ok(!/BLACK BARS/.test(m.error || ''), `${m.style}/${m.panel ?? 'final'} flagged: ${m.error}`);
+    }
+
+    // Spectaculars: exact 1692x468 and no black edge anywhere (borderless) /
+    // no excess beyond a uniform frame (framed).
+    const specs = motions.filter((m) => m.style === 'frame_break');
+    assert.equal(specs.length, 2);
+    for (const m of specs) {
+      const file = store.localPath(m.s3_key_final);
+      const p = await ffmpeg.probe(file);
+      assert.equal(p.width, 1692); assert.equal(p.height, 468);
+      const framed = isFramedPrompt(stills.find((st) => st.id === m.source_still_id).prompt);
+      const audit = await proveResidualBars(file, { framed });
+      assert.equal(audit.plan, null, `${framed ? 'framed' : 'borderless'} spectacular still has bars: ${JSON.stringify(audit.thickness)}`);
+      if (!framed) {
+        // Every edge band of a borderless piece is ART: brighter than any pad.
+        for (const band of [
+          { x: 0, y: 0, width: 1692, height: 12 }, { x: 0, y: 456, width: 1692, height: 12 },
+          { x: 0, y: 0, width: 40, height: 468 }, { x: 1652, y: 0, width: 40, height: 468 },
+        ]) {
+          const st = await ffmpeg.regionStats(file, band);
+          assert.ok(st && st.ymax > 80, `edge band ${JSON.stringify(band)} is dark (ymax ${st?.ymax}) — a bar leaked through`);
+        }
+      }
+    }
+
+    // EON masters: the geometric proof FAILS here (art bleeds into the
+    // bottom band), which used to ship the whole padded canvas squashed into
+    // 960x384. Now the measured step strips the real edges.
+    const sequences = await repo.listEonSequences(runId);
+    assert.equal(sequences.length, 2);
+    for (const seq of sequences) {
+      const file = store.localPath(seq.master_s3_key);
+      const p = await ffmpeg.probe(file);
+      assert.equal(p.width, 960); assert.equal(p.height, 384);
+      const audit = await proveResidualBars(file, { framed: false });
+      assert.equal(audit.plan, null, `EON master still has bars: ${JSON.stringify(audit.thickness)}`);
+      for (const band of [
+        { x: 0, y: 0, width: 960, height: 10 }, { x: 0, y: 374, width: 960, height: 10 },
+        { x: 0, y: 0, width: 24, height: 384 }, { x: 936, y: 0, width: 24, height: 384 },
+      ]) {
+        const st = await ffmpeg.regionStats(file, band);
+        assert.ok(st && st.ymax > 80, `EON edge band ${JSON.stringify(band)} is dark (ymax ${st?.ymax})`);
+      }
+    }
   } finally {
     await rm(base, { recursive: true, force: true });
   }
