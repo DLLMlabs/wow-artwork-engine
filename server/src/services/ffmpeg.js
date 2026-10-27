@@ -310,40 +310,63 @@ export function sampleFrameRate(durationS, sampleFps = 2, minFrames = 8) {
 }
 
 /**
- * Content bounding box over the WHOLE clip (sampled at `sampleFps`): the
- * largest non-black area cropdetect sees anywhere in the clip (reset=0 never
- * resets, so the box is the union across frames — a character that ever
- * reaches an edge keeps that edge). Returns { width, height, box } where box
- * is { width, height, x, y } or null when the full frame is content. Used by
- * bars.js to find padding the model left around the art after the geometric
- * strip (Jeff, 2026-10-21: letterboxed / L-shaped deliveries).
+ * Content box of a clip, measured FRAME BY FRAME (cropdetect reset=1) and
+ * combined per edge:
+ *   mode 'intersection' (default) — the thickest dark edge seen in ANY
+ *     sampled frame. The region that is art in EVERY frame. This is the one
+ *     that matters for delivery: a bar that is only there part of the time
+ *     (the picture drifting inside its canvas — Shawn's 2026-10-27 Masquerade
+ *     file: pure black at the bottom/right in a third of the frames, art in
+ *     the rest) still shows on the sign for those seconds.
+ *   mode 'union' — the largest content area seen in any frame (the old
+ *     cropdetect reset=0 behaviour; blind to moving bars).
+ * `limit` is the per-row mean luma at or below which a row/column is dark.
+ * 24 = pure black as the renders carry it (video black measures 16-17 after
+ * the model, Topaz and scaling); night-scene edges measure 37+ and are NOT
+ * caught. A lone still (no duration) skips the frame sampler.
+ * @returns {{width, height, box, thickness, frames, framesWithBar}} box is
+ *   null when the full frame is content.
  */
-export async function detectContentBox(input, { limit = 40, sampleFps = 2 } = {}) {
+export async function detectContentBox(input, { limit = 24, sampleFps = 2, mode = 'intersection' } = {}) {
   const probed = await probe(input);
-  // skip=0: cropdetect ignores its first two frames by default, which on a
-  // short sampled clip is every frame. Short clips also sample faster so the
-  // box is built from at least ~8 frames.
-  // A lone still (no duration) must not go through the fps sampler: it emits
-  // zero frames for a single image and the box comes back empty.
   const sampler = probed.duration ? `fps=${sampleFrameRate(probed.duration, sampleFps)},` : '';
   const args = [
     '-i', input,
-    '-vf', `${sampler}cropdetect=limit=${limit}:round=2:reset=0:skip=0`,
+    '-vf', `${sampler}cropdetect=limit=${limit}:round=2:reset=1:skip=0`,
     '-f', 'null', '-',
   ];
   let stderr = '';
   try {
-    ({ stderr } = await execFileP(FFMPEG(), args, { maxBuffer: 1024 * 1024 * 32 }));
+    ({ stderr } = await execFileP(FFMPEG(), args, { maxBuffer: 1024 * 1024 * 64 }));
   } catch (err) {
     stderr = String(err.stderr || '');
     if (!stderr.includes('crop=')) throw err;
   }
+  const W = probed.width;
+  const H = probed.height;
+  const empty = { width: W, height: H, box: null, thickness: { top: 0, bottom: 0, left: 0, right: 0 }, frames: 0, framesWithBar: { top: 0, bottom: 0, left: 0, right: 0 } };
   const matches = [...String(stderr).matchAll(/crop=(\d+):(\d+):(\d+):(\d+)/g)];
-  if (!matches.length || !probed.width) return { width: probed.width, height: probed.height, box: null };
-  const [, w, h, x, y] = matches[matches.length - 1].map(Number);
-  if (w < 16 || h < 16) return { width: probed.width, height: probed.height, box: null }; // all-dark scene
-  if (w >= probed.width && h >= probed.height) return { width: probed.width, height: probed.height, box: null };
-  return { width: probed.width, height: probed.height, box: { width: w, height: h, x, y } };
+  if (!matches.length || !W || !H) return empty;
+  const agg = { top: 0, bottom: 0, left: 0, right: 0 };
+  const framesWithBar = { top: 0, bottom: 0, left: 0, right: 0 };
+  let frames = 0;
+  for (const m of matches) {
+    const [, w, h, x, y] = m.map(Number);
+    if (w < 16 || h < 16) continue; // an all-dark frame says nothing about edges
+    frames += 1;
+    const t = { top: y, bottom: Math.max(0, H - y - h), left: x, right: Math.max(0, W - x - w) };
+    for (const e of ['top', 'bottom', 'left', 'right']) {
+      if (t[e] > 0) framesWithBar[e] += 1;
+      agg[e] = mode === 'union' ? (frames === 1 ? t[e] : Math.min(agg[e], t[e])) : Math.max(agg[e], t[e]);
+    }
+  }
+  if (!frames) return empty;
+  const thickness = agg;
+  const any = thickness.top || thickness.bottom || thickness.left || thickness.right;
+  const box = any
+    ? { x: thickness.left, y: thickness.top, width: W - thickness.left - thickness.right, height: H - thickness.top - thickness.bottom }
+    : null;
+  return { width: W, height: H, box, thickness, frames, framesWithBar };
 }
 
 /**

@@ -1198,10 +1198,11 @@ async function animateStill(still, ctx) {
       // A framed design's painted border, measured on the still, is excused.
       const allowancePx = frameFrac ? allowanceFromFractions(frameFrac, finalSpec) : undefined;
       const r = await trimDarkEdgeLines({ input: file, output: out, width: finalSpec.width, height: finalSpec.height, allowancePx });
-      if (r.path !== file) {
-        await rename(r.path, file);
-        logger.info({ stillId: still.id, passes: r.passes, trimmed: r.trimmed, remaining: r.remaining }, 'Trimmed dark edge lines at delivered size');
-      }
+      await rename(r.path, file);
+      logger.info({
+        stillId: still.id, cut: r.cut, fit: r.fit, capped: r.capped,
+        measured: { thickness: r.measured.thickness, framesWithBar: r.measured.framesWithBar, frames: r.measured.frames },
+      }, 'Final edge pass at delivered size (per-frame worst case + safety trim)');
     } catch (err) {
       logger.warn({ stillId: still.id, err: err.message }, 'Edge-line trim failed; delivering the conformed file');
     }
