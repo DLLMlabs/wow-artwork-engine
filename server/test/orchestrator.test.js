@@ -14,7 +14,7 @@ import { SURFACES } from '../src/services/generation/catalog.js';
 import { motionProvider, stillProvider } from '../src/services/generation/fixture.js';
 import { styleFor } from '../src/services/generation/prompts.js';
 import ffmpeg from '../src/services/ffmpeg.js';
-import { proveResidualBars, isFramedPrompt } from '../src/services/bars.js';
+import { proveResidualBars, isFramedPrompt, measureEdgeLines } from '../src/services/bars.js';
 import { rename } from 'node:fs/promises';
 
 const execFileP = promisify(execFile);
@@ -773,7 +773,9 @@ test('letterboxed + drifted model output ships edge-to-edge at spec (no bars, no
         const staged = `${args.output}.staged.mp4`;
         await execFileP('ffmpeg', [
           '-y', '-i', args.output,
-          '-vf', `scale=1200:${artH},pad=1280:720:60:180:black,format=yuv420p`,
+          // gblur: the model + upscaler blend art into the bar — the boundary is
+          // a fade, not a crisp line (Shawn, 2026-10-27: dark line along the bottom).
+          '-vf', `scale=1200:${artH},pad=1280:720:60:180:black,gblur=sigma=3,format=yuv420p`,
           '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-an', staged,
         ]);
         await rename(staged, args.output);
@@ -810,6 +812,9 @@ test('letterboxed + drifted model output ships edge-to-edge at spec (no bars, no
       const audit = await proveResidualBars(file, { framed });
       assert.equal(audit.plan, null, `${framed ? 'framed' : 'borderless'} spectacular still has bars: ${JSON.stringify(audit.thickness)}`);
       if (!framed) {
+        // No dark rim on any edge at the delivered size (the 2026-10-27 screenshot).
+        const rim = await measureEdgeLines(file);
+        assert.deepEqual(rim.lines, [], `dark edge line on the borderless spectacular: ${JSON.stringify(rim.stats)}`);
         // Every edge band of a borderless piece is ART: brighter than any pad.
         for (const band of [
           { x: 0, y: 0, width: 1692, height: 12 }, { x: 0, y: 456, width: 1692, height: 12 },
@@ -832,6 +837,8 @@ test('letterboxed + drifted model output ships edge-to-edge at spec (no bars, no
       assert.equal(p.width, 960); assert.equal(p.height, 384);
       const audit = await proveResidualBars(file, { framed: false });
       assert.equal(audit.plan, null, `EON master still has bars: ${JSON.stringify(audit.thickness)}`);
+      const rim = await measureEdgeLines(file);
+      assert.deepEqual(rim.lines, [], `dark edge line on the EON master: ${JSON.stringify(rim.stats)}`);
       for (const band of [
         { x: 0, y: 0, width: 960, height: 10 }, { x: 0, y: 374, width: 960, height: 10 },
         { x: 0, y: 0, width: 24, height: 384 }, { x: 936, y: 0, width: 24, height: 384 },

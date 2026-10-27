@@ -222,8 +222,15 @@ usable card usable.
        edge at all.
     3. **Fit** — content is never stretched and never padded: if the aspect still mismatches
        the spec it is center-cropped to fill edge to edge, with a loud flag on the card.
-    Finally the **delivered file itself is audited**: any proven-black edge left on it raises
-    a red "BLACK BARS remain — do not send" flag on the row.
+    *(2026-10-27, Shawn: "still a long black line along the bottom and a thin black line
+    across the right side")* — three tightenings: every stripped edge now **overshoots** a few
+    pixels into the art (the model and the upscaler blend art into the bar, so the measured
+    boundary is a dark fade, not a line); no sliver is too thin to count; and a framed
+    design's allowance is **measured on the approved still** (where the frame is painted)
+    instead of guessed from the video. Then a **last pass at the delivered size** looks for a
+    dark rim beside bright art on any edge, trims it and scales straight back to spec.
+    Finally the **delivered file itself is audited**: any proven-black edge or dark edge
+    line left on it raises a red "do not send" flag on the row.
 12. **QA.** Saturation-drift measurement (warning only — Seedance colors can drain), and
     **frame-order fidelity** *(2026-08-15)*: SSIM of the clip's first and last frames vs
     the approved still, logged on every render — a card flag fires whenever the END

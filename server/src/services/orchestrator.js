@@ -15,14 +15,14 @@
 // no spend.
 
 import path from 'node:path';
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, rm, rename, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 
 import config from '../config/index.js';
 import logger from '../config/logger.js';
 import ffmpeg from './ffmpeg.js';
 import { sliceMaster } from './eonSlicer.js';
-import { isFramedPrompt, stripResidualBars, proveResidualBars, fitForAspect, describeEdges } from './bars.js';
+import { isFramedPrompt, stripResidualBars, proveResidualBars, fitForAspect, describeEdges, trimDarkEdgeLines, measureEdgeLines, measureFrameFractions } from './bars.js';
 import * as guardrailsModule from './guardrails.js';
 import * as qaModule from './qa.js';
 import { planJobs, POST, SURFACES, SPECS } from './generation/catalog.js';
@@ -955,6 +955,19 @@ async function animateStill(still, ctx) {
   //      either: an aspect that still mismatches is center-cropped to fill
   //      the spec edge to edge, and the row is flagged for the reviewer.
   const framed = surface.post === POST.FRAME_BREAK && isFramedPrompt(still.prompt);
+  // The painted frame's thickness, measured on the APPROVED STILL (ground
+  // truth: that is where the frame is painted). Every black edge the video
+  // carries beyond it is padding and comes off (2026-10-27: guessing the
+  // frame from the video itself left padding on three sides).
+  let frameFrac = null;
+  if (framed) {
+    try {
+      frameFrac = await measureFrameFractions(ref);
+      logger.info({ stillId: still.id, frameFrac }, 'Painted frame measured on the approved still');
+    } catch (err) {
+      logger.warn({ stillId: still.id, err: err.message }, 'Could not measure the painted frame on the still — falling back to the video-derived allowance');
+    }
+  }
   const extractContent = async (input, model) => {
     if (String(model || '').startsWith('fixture') || !still.width || !still.height) {
       return { path: input, warn: null, fit: 'exact' };
@@ -983,7 +996,15 @@ async function animateStill(still, ctx) {
         const BLACK = 28; // mean 0-255 luma; true padding measures ~16
         if (lumas.length && lumas.every((l) => l !== null && l <= BLACK)) {
           const out = path.join(dir, 'content.mp4');
-          await ffmpeg.cropColumn({ input, output: out, width: bars.width, height: bars.height, x: bars.x, y: bars.y });
+          // INSET (Shawn, 2026-10-27): the geometric crop rounds to even
+          // pixels, and the model blends art into the bar over a few more —
+          // cut 4px INTO the art on every side so rounding and the fade can
+          // never leave a dark rim. Invisible at this size; a line is not.
+          const inset = 4;
+          await ffmpeg.cropColumn({
+            input, output: out,
+            width: bars.width - 2 * inset, height: bars.height - 2 * inset, x: bars.x + inset, y: bars.y + inset,
+          });
           logger.info({ stillId: still.id, bars, lumas }, 'Model letterboxed the render — stripped the proven-black padding');
           contentPath = out;
         } else {
@@ -996,7 +1017,7 @@ async function animateStill(still, ctx) {
     // Step 2 — measured residue, proven flat-black edge by edge.
     try {
       const out = path.join(dir, 'content_edges.mp4');
-      const r = await stripResidualBars({ input: contentPath, output: out, framed });
+      const r = await stripResidualBars({ input: contentPath, output: out, framed, frameFrac });
       if (r.path !== contentPath) {
         logger.info({ stillId: still.id, framed, stripped: describeEdges(r.strip), rejected: r.rejected }, 'Stripped residual black edges the model left around the art');
         contentPath = r.path;
@@ -1165,13 +1186,38 @@ async function animateStill(still, ctx) {
   // design's uniform painted border — is flagged in red on the card so it
   // never goes out unnoticed. Fixtures are skipped (synthetic art, synthetic
   // edges).
+  // LAST PASS at the delivered size (Shawn, 2026-10-27 screenshot: a thin
+  // dark line still along the bottom and the right edge). Whatever slipped
+  // past the render-size steps reads here as a dark rim beside bright art;
+  // bars.js trims it and scales straight back to spec. Fixtures skipped.
+  const trimEdgeLinesInPlace = async (file) => {
+    if (String(gen.model || '').startsWith('fixture')) return;
+    try {
+      const out = `${file}.edges.mp4`;
+      const r = await trimDarkEdgeLines({ input: file, output: out, width: finalSpec.width, height: finalSpec.height });
+      if (r.path !== file) {
+        await rename(r.path, file);
+        logger.info({ stillId: still.id, passes: r.passes, trimmed: r.trimmed, remaining: r.remaining }, 'Trimmed dark edge lines at delivered size');
+      }
+    } catch (err) {
+      logger.warn({ stillId: still.id, err: err.message }, 'Edge-line trim failed; delivering the conformed file');
+    }
+  };
+
   const auditDelivered = async (file) => {
     if (String(gen.model || '').startsWith('fixture')) return null;
     try {
-      const p = await proveResidualBars(file, { framed });
-      if (!p.plan) return null;
-      logger.error({ stillId: still.id, thickness: p.thickness, strip: p.plan.strip }, 'BLACK BARS remain on the delivered file');
-      return `qa: BLACK BARS remain on the delivered file (${describeEdges(p.plan.strip)}) — do not send; re-animate`;
+      const p = await proveResidualBars(file, { framed, frameFrac });
+      if (p.plan) {
+        logger.error({ stillId: still.id, thickness: p.thickness, strip: p.plan.strip }, 'BLACK BARS remain on the delivered file');
+        return `qa: BLACK BARS remain on the delivered file (${describeEdges(p.plan.strip)}) — do not send; re-animate`;
+      }
+      const lines = await measureEdgeLines(file);
+      if (lines.lines.length) {
+        logger.error({ stillId: still.id, edges: lines.lines, stats: lines.stats }, 'DARK EDGE LINE remains on the delivered file');
+        return `qa: DARK EDGE LINE remains on the delivered file (${lines.lines.join(', ')}) — do not send; re-animate`;
+      }
+      return null;
     } catch (err) {
       logger.warn({ stillId: still.id, err: err.message }, 'Delivered-file bar audit failed');
       return null;
@@ -1189,6 +1235,7 @@ async function animateStill(still, ctx) {
     // mismatch 'cover' center-crops the excess. Never 'contain': padding is
     // the letterbox Jeff saw (2026-10-21).
     await ffmpeg.conform({ input: srcVideo, output: master, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: contentFit });
+    await trimEdgeLinesInPlace(master);
     const barsWarn = await auditDelivered(master);
     const masterPut = await store.put({ key: key('master.mp4'), sourcePath: master });
     const panels = await sliceMaster({ masterPath: master, outDir: dir, pods, duration: effDuration });
@@ -1242,6 +1289,7 @@ async function animateStill(still, ctx) {
   // 'cover' center-crops the excess — never 'contain' (padding IS the
   // letterbox Jeff saw, 2026-10-21) and never a stretch.
   await ffmpeg.conform({ input: srcVideo, output: final, width: finalSpec.width, height: finalSpec.height, duration: effDuration, fps, fit: contentFit });
+  await trimEdgeLinesInPlace(final);
   const barsWarn = await auditDelivered(final);
   // FRAME PLATE on the delivered video: OFF by default (Shawn, 2026-08-11).
   // The stamp was burying characters that Seedance correctly rendered IN FRONT
