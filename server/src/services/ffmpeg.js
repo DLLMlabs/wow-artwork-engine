@@ -323,10 +323,12 @@ export async function detectContentBox(input, { limit = 40, sampleFps = 2 } = {}
   // skip=0: cropdetect ignores its first two frames by default, which on a
   // short sampled clip is every frame. Short clips also sample faster so the
   // box is built from at least ~8 frames.
-  const fps = sampleFrameRate(probed.duration, sampleFps);
+  // A lone still (no duration) must not go through the fps sampler: it emits
+  // zero frames for a single image and the box comes back empty.
+  const sampler = probed.duration ? `fps=${sampleFrameRate(probed.duration, sampleFps)},` : '';
   const args = [
     '-i', input,
-    '-vf', `fps=${fps},cropdetect=limit=${limit}:round=2:reset=0:skip=0`,
+    '-vf', `${sampler}cropdetect=limit=${limit}:round=2:reset=0:skip=0`,
     '-f', 'null', '-',
   ];
   let stderr = '';
@@ -351,11 +353,14 @@ export async function detectContentBox(input, { limit = 40, sampleFps = 2 } = {}
  * rather than dark art. Returns null when unmeasurable.
  */
 export async function regionStats(input, { width, height, x, y, sampleFps = 2 } = {}) {
-  let fps = sampleFps;
-  try { fps = sampleFrameRate((await probe(input)).duration, sampleFps); } catch { /* keep the default */ }
+  let sampler = `fps=${sampleFps},`;
+  try {
+    const d = (await probe(input)).duration;
+    sampler = d ? `fps=${sampleFrameRate(d, sampleFps)},` : ''; // a lone still: no sampler (it would emit nothing)
+  } catch { /* keep the default */ }
   const args = [
     '-i', input,
-    '-vf', `fps=${fps},crop=${width}:${height}:${x}:${y},signalstats,` +
+    '-vf', `${sampler}crop=${width}:${height}:${x}:${y},signalstats,` +
       'metadata=print:key=lavfi.signalstats.YAVG:file=-,metadata=print:key=lavfi.signalstats.YMAX:file=-',
     '-f', 'null', '-',
   ];
