@@ -14,7 +14,7 @@ import {
   planResidualStrip, edgeThickness, bandRegion, fitForAspect, isFramedPrompt,
   stripResidualBars, proveResidualBars, describeEdges, overshootFor,
   isDarkEdgeLine, edgeLineBands, measureEdgeLines, trimDarkEdgeLines,
-  measureFrameFractions, allowanceFromFractions,
+  measureFrameFractions, allowanceFromFractions, edgeStrip,
 } from '../src/services/bars.js';
 import ffmpeg from '../src/services/ffmpeg.js';
 import { buildStillPrompt } from '../src/services/generation/prompts.js';
@@ -267,11 +267,17 @@ test('trimDarkEdgeLines: a uniform painted frame is NOT a line and is left alone
   if (!(await hasFfmpeg())) return t.skip('ffmpeg not installed');
   const dir = await mkdtemp(path.join(os.tmpdir(), 'wae-bars-'));
   try {
-    // 20px black frame all round at the delivered size: outer and inner bands both dark.
+    // 20px black frame all round at the delivered size. With the frame measured
+    // on the still (allowance 20px) it is left alone; judged as borderless it is
+    // a band like any other and goes (2026-10-27: the scan now sees bands, so
+    // the allowance — not a guess — is what protects a painted frame).
     const input = await clip(dir, 'framed.mp4', 'pad=1692:468:20:20:black', { size: '1652x428' });
-    const r = await trimDarkEdgeLines({ input, output: path.join(dir, 'out.mp4'), width: 1692, height: 468 });
+    const allowancePx = { top: 20, bottom: 20, left: 20, right: 20 };
+    const r = await trimDarkEdgeLines({ input, output: path.join(dir, 'out.mp4'), width: 1692, height: 468, allowancePx });
     assert.equal(r.path, input);
     assert.equal(r.passes, 0);
+    const b = await trimDarkEdgeLines({ input, output: path.join(dir, 'out2.mp4'), width: 1692, height: 468 });
+    assert.ok(b.passes >= 1 && b.trimmed.top >= 20 && b.trimmed.left >= 20, JSON.stringify(b));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
@@ -311,6 +317,61 @@ test('measureFrameFractions: reads the painted frame off a still; a borderless s
     const plain = path.join(dir, 'plain.png');
     await execFileP('ffmpeg', ['-y', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=s=1000x300', '-frames:v', '1', plain]);
     assert.deepEqual(await measureFrameFractions(plain), { top: 0, bottom: 0, left: 0, right: 0 });
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+// 2026-10-27, second screenshot (Masquerade Carnival): the SAME L shape again
+// — bottom and right — after the line fix. The bars are thicker than a 2px
+// line (~8-16px at delivery) and dark grey, not black: the signature of a
+// model padding its canvas at the bottom and right. The final pass now scans
+// for a dark BAND beside bright art, up to 32px deep.
+test('trimDarkEdgeLines: thick dark-grey bands on the bottom and right (model canvas padding) are removed at delivery', async (t) => {
+  if (!(await hasFfmpeg())) return t.skip('ffmpeg not installed');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'wae-bars-'));
+  try {
+    // 1676x458 art + 16px dark-grey band right, 10px bottom (0x2c2c2c ≈ luma 54:
+    // too bright for the black proof, too thick for the 2px line check).
+    const input = await clip(dir, 'bands.mp4', 'pad=1692:468:0:0:0x2c2c2c', { size: '1676x458' });
+    const before = await measureEdgeLines(input);
+    assert.deepEqual(before.lines.sort(), ['bottom', 'right'], JSON.stringify(before));
+    assert.ok(before.thickness.right >= 14 && before.thickness.bottom >= 8, JSON.stringify(before.thickness));
+    const r = await trimDarkEdgeLines({ input, output: path.join(dir, 'out.mp4'), width: 1692, height: 468 });
+    assert.notEqual(r.path, input);
+    assert.ok(r.trimmed.right >= 16 && r.trimmed.bottom >= 10 && r.trimmed.top === 0 && r.trimmed.left === 0, JSON.stringify(r.trimmed));
+    const p = await ffmpeg.probe(r.path);
+    assert.equal(p.width, 1692); assert.equal(p.height, 468);
+    const after = await measureEdgeLines(r.path);
+    assert.deepEqual(after.lines, [], `band remains: ${JSON.stringify(after)}`);
+    // And the delivered edges are now art, not grey.
+    for (const edge of ['bottom', 'right']) {
+      const outer = await ffmpeg.regionStats(r.path, { ...edgeStrip({ edge, depth: 0, size: 2, width: 1692, height: 468 }) });
+      assert.ok(outer.yavg > 80, `${edge} edge still dark: ${outer.yavg}`);
+    }
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('measureEdgeLines: a painted frame excused by the still-measured allowance; a dark scene edge is never a band', async (t) => {
+  if (!(await hasFfmpeg())) return t.skip('ffmpeg not installed');
+  const dir = await mkdtemp(path.join(os.tmpdir(), 'wae-bars-'));
+  try {
+    // 20px black frame all round: a band by measurement, excused by a 20px allowance.
+    const framed = await clip(dir, 'framed.mp4', 'pad=1692:468:20:20:black', { size: '1652x428' });
+    const seen = await measureEdgeLines(framed);
+    assert.deepEqual(seen.lines.sort(), ['bottom', 'left', 'right', 'top']);
+    const excused = await measureEdgeLines(framed, { allowancePx: { top: 20, bottom: 20, left: 20, right: 20 } });
+    assert.deepEqual(excused.lines, []);
+    // But a frame PLUS 12px of padding under it is still caught beyond the allowance.
+    const framedPlus = await clip(dir, 'framedplus.mp4', 'pad=1672:448:20:20:black,pad=1692:468:0:0:0x2c2c2c', { size: '1632x408' });
+    const beyond = await measureEdgeLines(framedPlus, { allowancePx: { top: 20, bottom: 20, left: 20, right: 20 } });
+    assert.deepEqual(beyond.lines.sort(), ['bottom', 'right'], JSON.stringify(beyond));
+    // A dark scene edge: the reference band is dark too, so nothing qualifies.
+    const dusk = await clip(dir, 'dusk.mp4', 'drawbox=x=0:y=400:w=1692:h=68:color=0x202020@1:t=fill', { size: '1692x468' });
+    const d = await measureEdgeLines(dusk);
+    assert.deepEqual(d.lines, [], JSON.stringify(d));
   } finally {
     await rm(dir, { recursive: true, force: true });
   }

@@ -228,7 +228,11 @@ usable card usable.
     boundary is a dark fade, not a line); no sliver is too thin to count; and a framed
     design's allowance is **measured on the approved still** (where the frame is painted)
     instead of guessed from the video. Then a **last pass at the delivered size** looks for a
-    dark rim beside bright art on any edge, trims it and scales straight back to spec.
+    dark BAND beside bright art on any edge — a 2px rounding line or a 16px strip of dark-grey
+    model padding alike *(2026-10-27, second screenshot: the same L shape, bottom + right,
+    ~8-16px of grey)* — up to 5% of the axis deep, trims it (never more than 6% of an axis in
+    total) and scales straight back to spec. A painted frame is excused by the still's
+    measurement; a dark scene edge (dark art beyond the scan too) never qualifies.
     Finally the **delivered file itself is audited**: any proven-black edge or dark edge
     line left on it raises a red "do not send" flag on the row.
 12. **QA.** Saturation-drift measurement (warning only — Seedance colors can drain), and

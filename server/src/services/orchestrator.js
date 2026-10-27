@@ -22,7 +22,7 @@ import config from '../config/index.js';
 import logger from '../config/logger.js';
 import ffmpeg from './ffmpeg.js';
 import { sliceMaster } from './eonSlicer.js';
-import { isFramedPrompt, stripResidualBars, proveResidualBars, fitForAspect, describeEdges, trimDarkEdgeLines, measureEdgeLines, measureFrameFractions } from './bars.js';
+import { isFramedPrompt, stripResidualBars, proveResidualBars, fitForAspect, describeEdges, trimDarkEdgeLines, measureEdgeLines, measureFrameFractions, allowanceFromFractions } from './bars.js';
 import * as guardrailsModule from './guardrails.js';
 import * as qaModule from './qa.js';
 import { planJobs, POST, SURFACES, SPECS } from './generation/catalog.js';
@@ -977,6 +977,7 @@ async function animateStill(still, ctx) {
     // Step 1 — geometry + proof.
     try {
       const rawDims = await ffmpeg.probe(input);
+      logger.info({ stillId: still.id, raw: `${rawDims.width}x${rawDims.height}`, design: `${still.width}x${still.height}`, model }, 'Model output canvas');
       const bars = ffmpeg.computeBarCrop({ rawWidth: rawDims.width, rawHeight: rawDims.height, wantAspect: want });
       if (bars) {
         // Proof step: both stripped regions must be near-black padding.
@@ -1194,7 +1195,9 @@ async function animateStill(still, ctx) {
     if (String(gen.model || '').startsWith('fixture')) return;
     try {
       const out = `${file}.edges.mp4`;
-      const r = await trimDarkEdgeLines({ input: file, output: out, width: finalSpec.width, height: finalSpec.height });
+      // A framed design's painted border, measured on the still, is excused.
+      const allowancePx = frameFrac ? allowanceFromFractions(frameFrac, finalSpec) : undefined;
+      const r = await trimDarkEdgeLines({ input: file, output: out, width: finalSpec.width, height: finalSpec.height, allowancePx });
       if (r.path !== file) {
         await rename(r.path, file);
         logger.info({ stillId: still.id, passes: r.passes, trimmed: r.trimmed, remaining: r.remaining }, 'Trimmed dark edge lines at delivered size');
@@ -1212,10 +1215,11 @@ async function animateStill(still, ctx) {
         logger.error({ stillId: still.id, thickness: p.thickness, strip: p.plan.strip }, 'BLACK BARS remain on the delivered file');
         return `qa: BLACK BARS remain on the delivered file (${describeEdges(p.plan.strip)}) — do not send; re-animate`;
       }
-      const lines = await measureEdgeLines(file);
+      const allowancePx = frameFrac ? allowanceFromFractions(frameFrac, finalSpec) : undefined;
+      const lines = await measureEdgeLines(file, { allowancePx });
       if (lines.lines.length) {
-        logger.error({ stillId: still.id, edges: lines.lines, stats: lines.stats }, 'DARK EDGE LINE remains on the delivered file');
-        return `qa: DARK EDGE LINE remains on the delivered file (${lines.lines.join(', ')}) — do not send; re-animate`;
+        logger.error({ stillId: still.id, edges: lines.lines, thickness: lines.thickness, stats: lines.stats }, 'DARK EDGE BAND remains on the delivered file');
+        return `qa: DARK EDGE BAND remains on the delivered file (${describeEdges(lines.thickness)}) — do not send; re-animate`;
       }
       return null;
     } catch (err) {

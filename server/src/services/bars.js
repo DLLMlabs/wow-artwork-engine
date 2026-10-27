@@ -44,10 +44,21 @@ export const OVERSHOOT_MIN_PX = 4;
 /** Final-resolution edge-line check: outer 2px vs the 6px just inside. */
 export const EDGE_LINE_OUTER_PX = 2;
 export const EDGE_LINE_INNER_PX = 6;
-export const EDGE_LINE_MAX_LUMA = 70;   // an outer line brighter than this is not dark
-export const EDGE_LINE_RATIO = 0.55;    // ...and must be this much darker than its neighbour
+export const EDGE_LINE_MAX_LUMA = 80;   // an outer band brighter than this is not dark (VAE padding noise sits ~40-60)
+export const EDGE_LINE_RATIO = 0.6;     // ...and must be this much darker than the art beside it
 export const EDGE_LINE_TRIM_PX = 4;     // trimmed per pass (even for yuv420)
 export const EDGE_LINE_MAX_PASSES = 3;
+/**
+ * How deep (px, at the delivered size) the final pass scans for a dark BAND,
+ * not just a 2px line (Shawn, 2026-10-27 second screenshot: the bars were
+ * ~8-16px of dark grey, thicker than the line check looked and too noisy
+ * for the black proof). The reference "art" brightness is read from the
+ * strip just beyond the scan depth.
+ */
+export const EDGE_BAND_SCAN_PX = 48;
+export const EDGE_BAND_SCAN_FRAC = 0.05;  // ...and never deeper than 5% of the axis: a dark floor is not a bar
+export const EDGE_BAND_STEP_PX = 2;
+export const EDGE_TRIM_MAX_FRAC = 0.06;   // the final pass may never take more than 6% of an axis from one edge
 /** cropdetect black threshold (0-255). Topaz-lifted blacks sit around 20-30. */
 export const DETECT_LIMIT = 40;
 
@@ -256,26 +267,51 @@ export function isDarkEdgeLine({ outer, inner, maxLuma = EDGE_LINE_MAX_LUMA, rat
   return outer.yavg < maxLuma && outer.yavg < inner.yavg * ratio;
 }
 
+/** The strip `depth` px in from an edge, `size` px thick, full length. Pure. */
+export function edgeStrip({ edge, depth, size, width, height } = {}) {
+  switch (edge) {
+    case 'top': return { x: 0, y: depth, width, height: size };
+    case 'bottom': return { x: 0, y: height - depth - size, width, height: size };
+    case 'left': return { x: depth, y: 0, width: size, height };
+    case 'right': return { x: width - depth - size, y: 0, width: size, height };
+    default: return null;
+  }
+}
+
 /**
- * Measure, at the DELIVERED size, which edges still carry a dark line.
- * A uniform painted frame (outer and inner both dark) is not a line; a dark
- * scene edge (outer ≈ inner) is not a line. Only "black rim, bright art
- * beside it" counts.
- * @returns {Promise<{lines: string[], stats: object}>}
+ * Measure, at the DELIVERED size, how thick a dark BAND each edge carries.
+ * Reference = the art just beyond the scan depth (scanPx..2*scanPx in). From
+ * the edge inward, every `step` that is dark (below EDGE_LINE_MAX_LUMA and
+ * below EDGE_LINE_RATIO × reference) is band; the first bright step ends it.
+ * A painted frame is excused by `allowancePx` (measured on the still); a
+ * dark scene edge (reference dark too) never qualifies; a 2px rounding line
+ * and a 16px model-padding band are both caught.
+ * @returns {Promise<{width, height, lines: string[], thickness: object, stats: object}>}
  */
-export async function measureEdgeLines(input, { sampleFps = 2 } = {}) {
+export async function measureEdgeLines(input, { sampleFps = 2, scanPx = EDGE_BAND_SCAN_PX, step = EDGE_BAND_STEP_PX, allowancePx } = {}) {
   const { width, height } = await ffmpeg.probe(input);
   const lines = [];
+  const thickness = { top: 0, bottom: 0, left: 0, right: 0 };
   const stats = {};
   for (const edge of EDGES) {
-    const bands = edgeLineBands({ edge, width, height });
-    if (!bands) continue;
-    const outer = await ffmpeg.regionStats(input, { ...bands.outer, sampleFps });
-    const inner = await ffmpeg.regionStats(input, { ...bands.inner, sampleFps });
-    stats[edge] = { outer: outer?.yavg ?? null, inner: inner?.yavg ?? null };
-    if (isDarkEdgeLine({ outer, inner })) lines.push(edge);
+    const axis = edge === 'top' || edge === 'bottom' ? height : width;
+    const scan = Math.max(step, Math.min(scanPx, Math.floor(axis * EDGE_BAND_SCAN_FRAC)));
+    const allowed = allowancePx?.[edge] || 0;
+    // Reference art is read beyond the painted frame (if any) AND the scan depth.
+    const refBand = edgeStrip({ edge, depth: allowed + scan, size: scan, width, height });
+    const ref = await ffmpeg.regionStats(input, { ...refBand, sampleFps });
+    const outer = await ffmpeg.regionStats(input, { ...edgeStrip({ edge, depth: 0, size: step, width, height }), sampleFps });
+    stats[edge] = { outer: outer?.yavg ?? null, ref: ref?.yavg ?? null };
+    if (!ref || !outer || !isDarkEdgeLine({ outer, inner: ref })) continue;
+    let dark = step;
+    while (dark < scan) {
+      const st = await ffmpeg.regionStats(input, { ...edgeStrip({ edge, depth: dark, size: step, width, height }), sampleFps });
+      if (!st || !isDarkEdgeLine({ outer: st, inner: ref })) break;
+      dark += step;
+    }
+    if (dark > allowed) { thickness[edge] = dark; lines.push(edge); }
   }
-  return { width, height, lines, stats };
+  return { width, height, lines, thickness, stats };
 }
 
 /**
@@ -287,15 +323,27 @@ export async function measureEdgeLines(input, { sampleFps = 2 } = {}) {
  * exact spec (≤1% squash per pass, invisible). Up to maxPasses passes.
  * @returns {Promise<{path, passes, trimmed: object, remaining: string[]}>} path === input when nothing was trimmed.
  */
-export async function trimDarkEdgeLines({ input, output, width, height, maxPasses = EDGE_LINE_MAX_PASSES, trimPx = EDGE_LINE_TRIM_PX, sampleFps = 2 }) {
+export async function trimDarkEdgeLines({ input, output, width, height, maxPasses = EDGE_LINE_MAX_PASSES, trimPx = EDGE_LINE_TRIM_PX, sampleFps = 2, allowancePx }) {
   let current = input;
   let passes = 0;
   const trimmed = { top: 0, bottom: 0, left: 0, right: 0 };
-  let lines = (await measureEdgeLines(current, { sampleFps })).lines;
+  let m = await measureEdgeLines(current, { sampleFps, allowancePx });
+  let lines = m.lines;
+  const evenUp = (n) => Math.ceil(n / 2) * 2;
   while (lines.length && passes < maxPasses) {
     passes += 1;
     const cut = { top: 0, bottom: 0, left: 0, right: 0 };
-    for (const e of lines) { cut[e] = trimPx; trimmed[e] += trimPx; }
+    // Cut the band beyond the painted-frame allowance plus the usual overshoot
+    // (never less than trimPx); a framed design keeps its frame.
+    for (const e of lines) {
+      const axis = e === 'top' || e === 'bottom' ? height : width;
+      const excess = Math.max(0, (m.thickness[e] || 0) - (allowancePx?.[e] || 0));
+      const want = evenUp(Math.max(trimPx, excess + trimPx));
+      const room = Math.floor((Math.floor(axis * EDGE_TRIM_MAX_FRAC) - trimmed[e]) / 2) * 2;
+      cut[e] = room >= trimPx ? Math.min(want, room) : 0;
+      trimmed[e] += cut[e];
+    }
+    if (!EDGES.some((e) => cut[e] > 0)) break; // budget spent: stop, the audit will flag what is left
     const cropped = `${output}.pass${passes}.mp4`;
     await ffmpeg.cropColumn({
       input: current, output: cropped,
@@ -304,7 +352,8 @@ export async function trimDarkEdgeLines({ input, output, width, height, maxPasse
     const next = passes === maxPasses ? output : `${output}.scaled${passes}.mp4`;
     await ffmpeg.conform({ input: cropped, output: next, width, height, fit: 'exact' });
     current = next;
-    lines = (await measureEdgeLines(current, { sampleFps })).lines;
+    m = await measureEdgeLines(current, { sampleFps, allowancePx });
+    lines = m.lines;
   }
   if (passes === 0) return { path: input, passes, trimmed, remaining: lines };
   if (current !== output) await ffmpeg.conform({ input: current, output, width, height, fit: 'exact' });
@@ -322,5 +371,5 @@ export default {
   OVERSHOOT_FRAC, OVERSHOOT_MIN_PX, EDGE_LINE_TRIM_PX, EDGE_LINE_MAX_PASSES,
   edgeThickness, isFramedPrompt, overshootFor, planResidualStrip, bandRegion, fitForAspect,
   measureResidualBars, proveResidualBars, stripResidualBars, describeEdges,
-  measureFrameFractions, allowanceFromFractions, edgeLineBands, isDarkEdgeLine, measureEdgeLines, trimDarkEdgeLines,
+  measureFrameFractions, allowanceFromFractions, edgeLineBands, edgeStrip, isDarkEdgeLine, measureEdgeLines, trimDarkEdgeLines, EDGE_BAND_SCAN_PX, EDGE_BAND_SCAN_FRAC, EDGE_TRIM_MAX_FRAC,
 };
